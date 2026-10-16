@@ -1,37 +1,55 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Tech BD Income — Telegram Bot  (bot.py)
+Tech BD Income — Telegram Bot  (bot.py)  — একটাই ফাইল
 
-Runs 24/7 on any always-on computer (VPS, home PC, Termux, Raspberry Pi, Railway, Replit ...).
-The admin panel does NOT need to stay open.
+২৪ ঘন্টা চলে: Withdraw নোটিফিকেশন, Refer, Broadcast, DM নোটিফিকেশন, Telegram লিংক।
+অ্যাডমিন প্যানেল খোলা রাখতে হয় না।
 
-What it does (same as the admin-panel bot, just always on):
-  • Withdraw notifications   → channel message with Approve / Reject buttons + user DM + status updates
-  • Refer                    → /start <uid> gives the referral bonus and notifies the referrer
-  • Broadcast                → messages queued from the admin panel are sent in the background
-  • DM notifications         → new chat message / call alerts
-  • Telegram account linking → verifies the Mini-App login (initData) and saves the link
+─── Render.com এ চালানো (ফ্রি) ───────────────────────────────────────────
+ 1. GitHub এ একটা PRIVATE repo বানান। শুধু এই একটা ফাইল দিন:  bot.py
+    ⚠ serviceAccountKey.json / Token কখনো GitHub এ দেবেন না (দিলে Google চাবি নিজেই বন্ধ করে দেয়)।
+ 2. Render → New → Web Service → repo বাছুন →  Build Command:  pip install firebase-admin requests
+                                                Start Command:  python bot.py
+ 3. Environment → Add Environment Variable:
+       FIREBASE_KEY_JSON  =  Firebase চাবির .json ফাইলের পুরো লেখা (একদম সব)
+       (ঐচ্ছিক)  BOT_TOKEN, CHANNEL_ID  — অ্যাডমিন প্যানেলে সেভ করা থাকলে লাগবে না
+ 4. Deploy শেষে "Live" হলে Render এর URL কপি করুন। ফ্রি প্ল্যানে ১৫ মিনিট কোনো ভিজিট না এলে ঘুমিয়ে যায়,
+    তাই uptimerobot.com এ একটা HTTP monitor বানান (প্রতি ৫ মিনিট, ওই URL)। বট নিজেও নিজেকে পিং করে।
+ 5. অ্যাডমিন প্যানেল → Settings → Telegram Bot → Token/Channel সেভ → "bot.py Mode চালু করুন"।
 
-Setup (once):
-  1.  pip install firebase-admin requests
-  2.  Firebase Console → Project settings → Service accounts → "Generate new private key"
-      Save the file next to this script as  serviceAccountKey.json
-  3.  Admin panel → Settings → Telegram Bot: save the Bot Token / Channel ID, then turn ON "bot.py Mode"
-  4.  python3 bot.py        (keep it running, e.g. with systemd / pm2 / screen / nohup)
+─── নিজের কম্পিউটার/VPS এ চালানো ──────────────────────────────────────────
+    serviceAccountKey.json এই ফাইলের পাশে রাখুন, তারপর:   python3 bot.py     (Windows: py bot.py)
+    প্রথমবার লাইব্রেরি নিজে ইনস্টল হয়। ব্যাকগ্রাউন্ডে রাখতে:  nohup python3 bot.py > bot.log 2>&1 &
 
-Optional file  bot_config.json  (next to this script):
-  {"token": "...", "channelId": "-100...", "pyMode": true}
-  On start, any value that is still EMPTY in the admin panel (Firestore private/bot) is filled in from this file,
-  so the panel shows the Token / Channel and bot.py Mode is already ON. Values saved in the panel are never overwritten.
-  Keep this file and serviceAccountKey.json on the bot computer only - never upload them to your website.
-
-Optional environment variables:
-  GOOGLE_APPLICATION_CREDENTIALS   path of the service-account json (default: ./serviceAccountKey.json)
-  BOT_TOKEN, CHANNEL_ID            override the values saved in the admin panel
+─── অন্যান্য ───────────────────────────────────────────────────────────────
+  • বটকে আপনার চ্যানেলের Admin বানান (মেসেজ পোস্ট ও এডিট)।
+  • Firebase চাবির জায়গা (যেটা আগে পায় সেটা নেয়): FIREBASE_KEY_JSON (লেখা বা base64) →
+    GOOGLE_APPLICATION_CREDENTIALS (ফাইলের পথ) → ./serviceAccountKey.json → /etc/secrets/serviceAccountKey.json
+  • ঐচ্ছিক ফাইল bot_config.json:  {"token": "...", "channelId": "-100...", "pyMode": true}
+    অ্যাডমিন প্যানেলে যে মান ফাঁকা সেটা এখান/Environment থেকে ভরা হয়; প্যানেলের মান কখনো বদলায় না।
 """
-from __future__ import annotations
+import subprocess
+import sys
 
+
+def _ensure_deps():
+    try:
+        import requests, firebase_admin  # noqa: F401
+        return
+    except ImportError:
+        pass
+    print("📦 দরকারি লাইব্রেরি ইনস্টল হচ্ছে (firebase-admin, requests)... একটু অপেক্ষা করুন", flush=True)
+    base = [sys.executable, "-m", "pip", "install", "-q", "firebase-admin", "requests"]
+    try:
+        subprocess.check_call(base)
+    except subprocess.CalledProcessError:
+        subprocess.check_call(base + ["--break-system-packages"])      # newer Linux / Termux
+    import os
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_deps()
+
+import base64
 import hashlib
 import hmac
 import html
@@ -40,10 +58,10 @@ import os
 import re
 import signal
 import socket
-import sys
 import threading
 import time
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -51,9 +69,9 @@ import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-KEY_FILE = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.path.join(BASE_DIR, "serviceAccountKey.json")
+KEY_FILES = [p for p in (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"), os.path.join(BASE_DIR, "serviceAccountKey.json"), "/etc/secrets/serviceAccountKey.json") if p]
 OFFSET_FILE = os.path.join(BASE_DIR, ".bot_offset")
 CONFIG_FILE = os.path.join(BASE_DIR, "bot_config.json")
 PING_MAX_AGE = 300          # seconds: older "new message" alerts are dropped
@@ -68,6 +86,93 @@ try:                         # new Firestore clients prefer FieldFilter
 except Exception:            # older clients / test doubles
     def where(q, field, op, value):
         return q.where(field, op, value)
+
+
+HEALTH = {"ok": False, "state": "starting", "note": "", "version": VERSION}
+_FB_READY = [False]
+
+
+class BotSetupError(Exception):
+    """A problem the owner must fix (bad key, missing key ...). The message is shown in plain words."""
+
+
+def _fix_key(d: dict) -> dict:
+    pk = d.get("private_key") or ""
+    if "\\n" in pk and "\n" not in pk:           # key pasted with literal backslash-n characters
+        d["private_key"] = pk.replace("\\n", "\n")
+    return d
+
+
+def load_service_account():
+    """Return a path (str) or a dict for firebase_admin.credentials.Certificate()."""
+    raw = (os.environ.get("FIREBASE_KEY_JSON") or "").strip()
+    if raw:
+        for attempt in (raw, None):
+            try:
+                txt = raw if attempt else base64.b64decode(raw).decode("utf-8")
+                d = json.loads(txt)
+                if isinstance(d, dict) and d.get("private_key") and d.get("client_email"):
+                    return _fix_key(d)
+            except Exception:
+                continue
+        raise BotSetupError("FIREBASE_KEY_JSON পড়া যাচ্ছে না। .json ফাইলের পুরো লেখা (শুরুর { থেকে শেষের } পর্যন্ত) হুবহু বসান।")
+    for p in KEY_FILES:
+        if os.path.exists(p):
+            return p
+    raise BotSetupError("Firebase চাবি পাওয়া যায়নি। Render এ Environment Variable FIREBASE_KEY_JSON দিন "
+                        "(অথবা নিজের কম্পিউটারে serviceAccountKey.json এই ফাইলের পাশে রাখুন)। "
+                        "চাবি পাবেন: Firebase Console → Project settings → Service accounts → Generate new private key")
+
+
+def explain_firebase_error(e: Exception) -> str:
+    m = str(e)
+    if "invalid_grant" in m or "Invalid JWT" in m or "invalid_client" in m:
+        return ("Firebase চাবি কাজ করছে না (Invalid JWT Signature)। চাবিটা বাতিল হয়েছে বা নষ্ট। "
+                "GitHub এ চাবি আপলোড হলে Google নিজেই সেটা বন্ধ করে দেয়। সমাধান: Firebase Console → Project settings → "
+                "Service accounts → Generate new private key দিয়ে নতুন চাবি বানান এবং শুধু Render এর FIREBASE_KEY_JSON এ বসান "
+                "(GitHub এ রাখবেন না)। তারপর Render এ Manual Deploy দিন।")
+    if "PERMISSION_DENIED" in m or "403" in m:
+        return "Firebase চাবির অনুমতি নেই বা Firestore চালু নেই: " + m[:160]
+    return "Firebase এর সাথে যুক্ত হওয়া যায়নি: " + m[:200]
+
+
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps(HEALTH, ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+    do_HEAD = do_GET
+
+    def log_message(self, *a):
+        pass
+
+
+def start_health_server():
+    """Render (Web Service) needs an open port, and uptime monitors need something to visit."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", int(port)), _Health)
+    except OSError as e:
+        print("health server:", e, flush=True)
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print("🌐 Health server চালু (port %s)" % port, flush=True)
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if url:                                          # ping ourselves so the free instance is not put to sleep
+        def keep():
+            while True:
+                time.sleep(540)
+                try:
+                    requests.get(url, timeout=20)
+                except Exception:
+                    pass
+        threading.Thread(target=keep, daemon=True).start()
 
 
 def esc(s) -> str:
@@ -97,10 +202,19 @@ class TgError(Exception):
 
 class Bot:
     def __init__(self):
-        if not os.path.exists(KEY_FILE):
-            sys.exit("❌ serviceAccountKey.json পাওয়া যায়নি: %s\n   Firebase Console → Project settings → Service accounts → Generate new private key" % KEY_FILE)
-        firebase_admin.initialize_app(credentials.Certificate(KEY_FILE))
-        self.db = firestore.client()
+        cred = credentials.Certificate(load_service_account())
+        try:
+            chk = getattr(cred, "get_access_token", None)
+            if chk:
+                chk()                      # fails at once (not after 5 minutes) if the key is revoked / damaged
+            if not _FB_READY[0]:
+                firebase_admin.initialize_app(cred)
+                _FB_READY[0] = True
+            self.db = firestore.client()
+        except BotSetupError:
+            raise
+        except Exception as e:
+            raise BotSetupError(explain_firebase_error(e))
         self.http = requests.Session()
         self.cfg, self.cfg_t = {}, 0.0
         self.stop = threading.Event()
@@ -120,6 +234,10 @@ class Bot:
             self.offset = int(open(OFFSET_FILE).read().strip() or 0)
         except Exception:
             pass
+        try:                                   # survives restarts / redeploys on hosts without a permanent disk
+            self.offset = max(self.offset, int((self.col("private").document("botState").get().to_dict() or {}).get("offset") or 0))
+        except Exception:
+            pass
 
     # ───────────────────────── helpers ─────────────────────────
     def file_cfg(self) -> dict:
@@ -130,9 +248,19 @@ class Bot:
         except (OSError, ValueError):
             return {}
 
+    def env_cfg(self) -> dict:
+        d = {}
+        if os.environ.get("BOT_TOKEN"):
+            d["token"] = os.environ["BOT_TOKEN"].strip()
+        if os.environ.get("CHANNEL_ID"):
+            d["channelId"] = os.environ["CHANNEL_ID"].strip()
+        if os.environ.get("ENABLE_PY_MODE", "").lower() in ("1", "true", "yes"):
+            d["pyMode"] = True
+        return d
+
     def bootstrap(self):
         """Copy Token / Channel / bot.py Mode from bot_config.json into the admin-panel settings (only where empty)."""
-        f = self.file_cfg()
+        f = {**self.file_cfg(), **self.env_cfg()}
         if not f:
             return
         ref = self.col("private").document("bot")
@@ -146,7 +274,7 @@ class Bot:
             upd["pyMode"] = True
         if upd:
             ref.set(upd, merge=True)
-            self.log("⚙ অ্যাডমিন প্যানেলের সেটিং bot_config.json থেকে ভরা হয়েছে: %s" % ", ".join(sorted(upd)))
+            self.log("⚙ অ্যাডমিন প্যানেলের ফাঁকা সেটিং ভরা হয়েছে: %s" % ", ".join(sorted(upd)))
 
     def log(self, msg: str):
         msg = re.sub(r"bot\d{6,12}:[A-Za-z0-9_-]{30,}", "bot***", str(msg))     # never print the token into logs
@@ -548,9 +676,15 @@ class Bot:
             except OSError:
                 pass
             self.pool.submit(self.safe, self.handle_update, u)
+        if ups:
+            try:
+                self.col("private").document("botState").set({"offset": self.offset}, merge=True)
+            except Exception:
+                pass
 
     def heartbeat(self):
         while not self.stop.is_set():
+            HEALTH.update({"ok": self.state == "running", "state": self.state, "note": " | ".join(self.logbuf[-2:])[-300:], "stats": self.stats})
             try:
                 self.col("private").document("botStatus").set({
                     "ts": firestore.SERVER_TIMESTAMP, "version": VERSION, "state": self.state, "engine": "bot.py",
@@ -615,5 +749,27 @@ class Bot:
         self.log("👋 বন্ধ হয়েছে")
 
 
+def main():
+    start_health_server()
+    while True:
+        try:
+            bot = Bot()
+            bot.run()
+            if bot.stop.is_set():
+                break                           # stopped on purpose (Ctrl+C / kill)
+        except BotSetupError as e:
+            HEALTH.update({"ok": False, "state": "error", "note": str(e)})
+            print("❌ " + str(e), flush=True)
+            time.sleep(60)                      # keep the web port open so you can read the message, then try again
+            continue
+        except SystemExit:
+            raise
+        except KeyboardInterrupt:
+            break
+        except Exception as e:                  # unexpected crash → start again
+            print("⚠ বট বন্ধ হয়ে গিয়েছিল (%s) — ৫ সেকেন্ডে আবার চালু হচ্ছে" % e, flush=True)
+        time.sleep(5)
+
+
 if __name__ == "__main__":
-    Bot().run()
+    main()
