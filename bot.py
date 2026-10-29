@@ -1,7 +1,7 @@
 """
 Tech BD Income — Telegram Bot  (bot.py)  — একটাই ফাইল
 
-২৪ ঘন্টা চলে: Withdraw নোটিফিকেশন, Refer, Broadcast, DM নোটিফিকেশন, Telegram লিংক।
+২৪ ঘন্টা চলে: Withdraw নোটিফিকেশন, Refer, Broadcast, DM নোটিফিকেশন, Telegram লিংক, চ্যানেল/গ্রুপ জয়েন যাচাই।
 অ্যাডমিন প্যানেল খোলা রাখতে হয় না।
 
 ─── Render.com এ চালানো (ফ্রি) ───────────────────────────────────────────
@@ -63,13 +63,13 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-VERSION = "1.2.0"
+VERSION = "1.4.1"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KEY_FILES = [p for p in (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"), os.path.join(BASE_DIR, "serviceAccountKey.json"), "/etc/secrets/serviceAccountKey.json") if p]
 OFFSET_FILE = os.path.join(BASE_DIR, ".bot_offset")
@@ -124,6 +124,17 @@ def load_service_account():
                         "চাবি পাবেন: Firebase Console → Project settings → Service accounts → Generate new private key")
 
 
+def key_info(src):
+    """(where the key came from, first 8 characters of its id) - safe to print, helps to spot an old key."""
+    try:
+        if isinstance(src, dict):
+            return "FIREBASE_KEY_JSON", str(src.get("private_key_id") or "?")[:8]
+        with open(src, encoding="utf-8") as f:
+            return "ফাইল " + os.path.basename(str(src)), str(json.load(f).get("private_key_id") or "?")[:8]
+    except Exception:
+        return "?", "?"
+
+
 def explain_firebase_error(e: Exception) -> str:
     m = str(e)
     if "invalid_grant" in m or "Invalid JWT" in m or "invalid_client" in m:
@@ -175,6 +186,24 @@ def start_health_server():
         threading.Thread(target=keep, daemon=True).start()
 
 
+BST = timezone(timedelta(hours=6))
+
+
+def mask_name(n) -> str:
+    n = str(n or "").strip()
+    return (n[0] + "***" + n[-1] if len(n) > 2 else n[0] + "***") if n else "User"
+
+
+def mask_acct(a) -> str:
+    a = re.sub(r"\s+", "", str(a or ""))
+    return a[:3] + "****" + a[-3:] if len(a) >= 8 else ("****" + a[-2:] if len(a) >= 3 else "****")
+
+
+def fmt_when(ts) -> str:
+    dt = ts if isinstance(ts, datetime) else datetime.now(timezone.utc)
+    return dt.astimezone(BST).strftime("%d %b %Y, %I:%M %p") + " (BST)"
+
+
 def esc(s) -> str:
     return html.escape("" if s is None else str(s), quote=False)
 
@@ -202,7 +231,10 @@ class TgError(Exception):
 
 class Bot:
     def __init__(self):
-        cred = credentials.Certificate(load_service_account())
+        src = load_service_account()
+        where, kid = key_info(src)
+        print("🔑 Firebase চাবি: %s, ID: %s…" % (where, kid), flush=True)
+        cred = credentials.Certificate(src)
         try:
             chk = getattr(cred, "get_access_token", None)
             if chk:
@@ -214,7 +246,7 @@ class Bot:
         except BotSetupError:
             raise
         except Exception as e:
-            raise BotSetupError(explain_firebase_error(e))
+            raise BotSetupError(explain_firebase_error(e) + "  [চাবির উৎস: %s, ID: %s…]" % (where, kid))
         self.http = requests.Session()
         self.cfg, self.cfg_t = {}, 0.0
         self.stop = threading.Event()
@@ -222,7 +254,7 @@ class Bot:
         self.unsubs, self.active = [], False
         self.admins = (0.0, set())
         self.logbuf, self.state, self.note = [], "starting", ""
-        self.stats = {"withdrawNew": 0, "withdrawDone": 0, "refers": 0, "pings": 0, "links": 0, "broadcast": 0}
+        self.stats = {"withdrawNew": 0, "withdrawDone": 0, "refers": 0, "pings": 0, "links": 0, "broadcast": 0, "joinChecks": 0}
         self.send_lock, self.last_send = threading.Lock(), 0.0
         self.busy_bc = set()
         self.offset = 0
@@ -297,6 +329,8 @@ class Bot:
             "channel": str(os.environ.get("CHANNEL_ID") or c.get("channelId") or fc.get("channelId") or ""),
             "username": c.get("botUsername") or "",
             "py": c.get("pyMode") is True,
+            "proof": str(c.get("proofChannel") or ""),
+            "proof_pinned": c.get("proofPinned") is True,
             "app_url": st.get("appUrl") or "",
             "ref_reward": num(st.get("refReward")),
         }
@@ -379,6 +413,44 @@ class Bot:
                 spent += num(x.get("amount"))
         return round(earned - spent, 2)
 
+    # ───────────────────────── public payment proof ─────────────────────────
+    def publish_payout(self, wid: str, w: dict):
+        """Create the public record of an approved payout (once). Also posts it to the public proof channel."""
+        ref = self.col("payoutsFeed").document(wid)
+        data = {"name": mask_name(w.get("name")), "acct": mask_acct(w.get("address")), "method": str(w.get("method") or ""),
+                "amount": num(w.get("amount")), "ref": wid[:6].upper(), "txid": str(w.get("txid") or "").strip()[:40],
+                "ts": w.get("reviewedAt") if isinstance(w.get("reviewedAt"), datetime) else firestore.SERVER_TIMESTAMP}
+        try:
+            ref.create(data)
+        except Exception as e:
+            if type(e).__name__ != "AlreadyExists":
+                raise
+            upd = {"acct": data["acct"], "ref": data["ref"], "method": data["method"]}
+            if data["txid"]:
+                upd["txid"] = data["txid"]
+            ref.set(upd, merge=True)
+            return False
+        self.col("settings").document("payStats").set({"totalAmount": firestore.Increment(data["amount"]), "count": firestore.Increment(1), "last": firestore.SERVER_TIMESTAMP}, merge=True)
+        if self.cfg.get("proof"):
+            self.try_tg("sendMessage", chat_id=self.cfg["proof"], parse_mode="HTML", disable_web_page_preview=True,
+                        text="✅ <b>Payment Sent</b>\n👤 %s\n🏦 %s • %s\n💰 <b>BDT %.2f</b>\n🕒 %s\n🧾 Ref #%s%s"
+                        % (esc(data["name"]), esc(data["method"]), esc(data["acct"]), data["amount"], fmt_when(data["ts"]), data["ref"],
+                           (" • Txn: <code>%s</code>" % esc(data["txid"])) if data["txid"] else ""))
+        return True
+
+    def ensure_proof_intro(self):
+        """Post and pin one explanation message in the public proof channel (only once)."""
+        c = self.cfg
+        if not c.get("proof") or c.get("proof_pinned"):
+            return
+        m = self.try_tg("sendMessage", chat_id=c["proof"], parse_mode="HTML",
+                        text="✅ <b>Payment Proofs</b>\n\nEvery withdrawal paid by Tech BD Income is posted here automatically after it is sent: "
+                             "masked name, payment method, masked account, amount, date, reference and transaction ID.")
+        if m:
+            self.try_tg("pinChatMessage", chat_id=c["proof"], message_id=m["message_id"], disable_notification=True)
+            self.col("private").document("bot").set({"proofPinned": True}, merge=True)
+            self.cfg["proof_pinned"] = True
+
     # ───────────────────────── withdrawals ─────────────────────────
     def tg_withdraw(self, snap):
         w, ref, cfg = snap.to_dict() or {}, snap.reference, self.cfg
@@ -414,12 +486,10 @@ class Bot:
                     msg = "❌ <b>Withdraw Rejected</b>\n\n💰 %s\n%s\nটাকা আপনার ব্যালেন্সে ফেরত এসেছে।" % (bdt(w.get("amount")), ("📝 কারণ: %s\n" % esc(w["note"])) if w.get("note") else "")
                 self.tg_dm(w.get("uid"), link, parse_mode="HTML", text=msg)
             if ok:
-                name = (w.get("name") or "").strip()
-                masked = (name[0] + "***" + name[-1] if len(name) > 2 else name[0] + "***") if name else "User"
                 try:
-                    self.col("payoutsFeed").add({"name": masked, "amount": num(w.get("amount")), "method": w.get("method"), "ts": firestore.SERVER_TIMESTAMP})
+                    self.publish_payout(snap.id, w)
                 except Exception as e:
-                    self.log("⚠ payoutsFeed: %s" % e)
+                    self.log("⚠ payment proof: %s" % e)
             fresh = ref.get().to_dict() or {}
             if fresh.get("chMsgId") and fresh.get("chText"):
                 self.try_tg("editMessageText", chat_id=cfg["channel"], message_id=fresh["chMsgId"], parse_mode="HTML",
@@ -486,6 +556,53 @@ class Bot:
         else:
             self.log("⚠ Telegram যাচাই ব্যর্থ (Token ঠিক আছে? অ্যাপ Telegram এর ভেতর থেকে খোলা?)")
         snap.reference.delete()
+
+    # ───────────────────────── join gate (channels / groups set in the admin panel) ─────────────────────────
+    def join_check(self, snap):
+        """The app asks 'did this user join everything?'. Answer is written to joinRes/<uid> (the app waits for it)."""
+        uid, req = snap.id, snap.to_dict() or {}
+        nonce = str(req.get("nonce") or "")
+        if not nonce:
+            return
+        ts = req.get("ts")
+        if isinstance(ts, datetime) and (datetime.now(timezone.utc) - ts).total_seconds() > 180:
+            return                                              # an old request (bot was offline) - the app already gave up
+        res_ref = self.col("joinRes").document(uid)
+        old = res_ref.get().to_dict() or {}
+        if old.get("nonce") == nonce:
+            return                                              # already answered
+        cfg = self.col("settings").document("join").get().to_dict() or {}
+        items = [x for x in (cfg.get("items") or [])][:10]
+        out = {"nonce": nonce, "ok": False, "missing": [], "unverifiable": [], "ver": cfg.get("ver") or 0, "ts": firestore.SERVER_TIMESTAMP}
+        user = self.verify_init(req.get("initData")) if req.get("initData") else None
+        tg_id = int(user["id"]) if user and user.get("id") else None
+        if tg_id is None:
+            link = self.tg_of(uid)
+            if link and str(link.get("tgId") or "").isdigit() and not req.get("initData"):
+                tg_id = int(link["tgId"])
+        if tg_id is None:
+            out["error"] = "no-telegram"
+            res_ref.set(out)
+            self.log("⚠ জয়েন যাচাই: Telegram পরিচয় পাওয়া যায়নি (%s…)" % uid[:8])
+            return
+        for i, it in enumerate(items):
+            chat = str((it or {}).get("chat") or "").strip()
+            if not chat:
+                out["unverifiable"].append(i)                   # no @username / id given in the panel → cannot be checked
+                continue
+            try:
+                m = self.tg("getChatMember", chat_id=int(chat) if re.fullmatch(r"-?\d+", chat) else chat, user_id=tg_id)
+                st = m.get("status")
+                joined = st in ("creator", "administrator", "member") or (st == "restricted" and m.get("is_member") is True)
+                if not joined:
+                    out["missing"].append(i)
+            except TgError as e:
+                out["unverifiable"].append(i)                   # e.g. the bot is not admin there → do not lock the user out
+                self.log("⚠ জয়েন যাচাই %s: %s (বটকে ওই চ্যানেল/গ্রুপের Admin বানান)" % (chat, e))
+        out["ok"] = not out["missing"]
+        res_ref.set(out)
+        self.stats["joinChecks"] += 1
+        self.log("🔎 Join check %s…: %s" % (uid[:8], "✅ সব জয়েন করেছে" if out["ok"] else "❌ বাকি %s" % out["missing"]))
 
     # ───────────────────────── Telegram updates ─────────────────────────
     def is_chan_admin(self, uid) -> bool:
@@ -642,11 +759,17 @@ class Bot:
             except Exception as e:
                 self.log("⚠ botUsername: %s" % e)
         self.active = True              # set before the listeners start (their first callbacks run at once)
+        try:
+            self.ensure_proof_intro()
+        except Exception as e:
+            self.log("⚠ proof channel: %s" % e)
         sub = lambda q, cb: self.unsubs.append(q.on_snapshot(cb))
         sub(self.col("withdrawals").order_by("ts", direction=firestore.Query.DESCENDING).limit(150),
             lambda docs, ch, t: [self.pool.submit(self.safe, self.tg_withdraw, c.document) for c in ch if c.type.name != "REMOVED"])
         sub(self.col("pings"),
             lambda docs, ch, t: [self.pool.submit(self.safe, self.tg_ping, c.document) for c in ch if c.type.name == "ADDED"])
+        sub(self.col("joinReq"),
+            lambda docs, ch, t: [self.pool.submit(self.safe, self.join_check, c.document) for c in ch if c.type.name in ("ADDED", "MODIFIED")])
         sub(self.col("tgReq"),
             lambda docs, ch, t: [self.pool.submit(self.safe, self.tg_link_req, c.document) for c in ch if c.type.name != "REMOVED"])
         sub(where(self.col("broadcasts"), "status", "in", ["queued", "sending"]),
